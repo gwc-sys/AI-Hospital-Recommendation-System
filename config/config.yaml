@@ -1,0 +1,41 @@
+project:
+  name: ai-hospital-recommendation-system
+  environment: development
+
+data:
+  raw_path: data/raw/hospitals_raw_data.csv
+  enhanced_path: data/processed/enhanced_hospitals_data.csv
+  processed_path: data/processed/final_hospital_dataset.csv
+
+data_collection:
+  default_location:
+    latitude: 12.9716
+    longitude: 77.5946
+
+google_maps:
+  search_radius: 10000
+
+model:
+  random_state: 42
+  test_size: 0.2
+  classifier:
+    max_depth: 4
+    random_state: 42
+  regressor:
+    max_depth: 4
+    random_state: 42
+  classifier_path: models/decision_tree_classifier.pkl
+  regressor_path: models/decision_tree_regressor.pkl
+
+recommendation:
+  classification_threshold: 0.6
+  weights:
+    response_probability: 0.35
+    emergency_score: 0.25
+    distance: 0.20
+    has_phone: 0.10
+    has_website: 0.10
+
+api:
+  host: 0.0.0.0
+  port: 8000
