@@ -1,0 +1,4 @@
+name,facility_type,latitude,longitude,emergency_facility,is_open_now,quality_score,response_probability,phone_number,website,vicinity
+Closed Doctor Hospital,doctor,18.5207,73.8567,True,False,95.0,0.45,N/A,N/A,Very close but closed
+Open City Hospital,establishment,18.5212,73.8567,True,True,145.0,0.92,0200000000,https://city.example,Slightly farther and open
+Open Backup Hospital,establishment,18.5215,73.8567,True,True,120.0,0.80,0201111111,https://backup.example,Another nearby option

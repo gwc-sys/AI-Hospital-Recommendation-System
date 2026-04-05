@@ -1,0 +1,2 @@
+name,latitude,longitude,vicinity,phone_number,website,is_open_now,emergency_facility,quality_score,facility_type
+Emergency Hospital,18.5205,73.8568,Central Pune,111,https://example.com,True,True,90,hospital

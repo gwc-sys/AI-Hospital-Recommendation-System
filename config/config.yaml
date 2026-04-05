@@ -8,12 +8,51 @@ data:
   processed_path: data/processed/final_hospital_dataset.csv
 
 data_collection:
-  default_location:
-    latitude: 12.9716
-    longitude: 77.5946
+  default_city: pune
+  cities:
+    pune:
+      latitude: 18.5204
+      longitude: 73.8567
+      search_points:
+        - name: central_pune
+          latitude: 18.5204
+          longitude: 73.8567
+        - name: shivajinagar
+          latitude: 18.5314
+          longitude: 73.8446
+        - name: kothrud
+          latitude: 18.5074
+          longitude: 73.8077
+        - name: aundh
+          latitude: 18.5590
+          longitude: 73.8078
+        - name: baner
+          latitude: 18.5598
+          longitude: 73.7865
+        - name: hadapsar
+          latitude: 18.5089
+          longitude: 73.9259
+        - name: wagholi
+          latitude: 18.5803
+          longitude: 73.9789
+        - name: pimpri_chinchwad
+          latitude: 18.6298
+          longitude: 73.7997
+        - name: nigdi
+          latitude: 18.6513
+          longitude: 73.7706
+        - name: katraj
+          latitude: 18.4575
+          longitude: 73.8508
+        - name: sinhagad_road
+          latitude: 18.4828
+          longitude: 73.8214
+        - name: magarpatta
+          latitude: 18.5158
+          longitude: 73.9287
 
 google_maps:
-  search_radius: 10000
+  search_radius: 5000
 
 model:
   random_state: 42

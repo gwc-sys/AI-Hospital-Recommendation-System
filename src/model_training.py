@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+import sys
 from typing import Dict
 
 import joblib
@@ -16,13 +17,16 @@ from sklearn.metrics import classification_report, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
 from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from src.utils import DATA_DIR, MODELS_DIR, ensure_directories
 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
 
 
@@ -207,7 +211,7 @@ class HospitalModelTrainer:
         self.regressor = joblib.load(target_dir / "decision_tree_regressor.pkl")
         self.label_encoders = joblib.load(target_dir / "label_encoders.pkl")
         logger.info("Models loaded from %s", target_dir)
-
+ 
 
 if __name__ == "__main__":
     metrics = HospitalModelTrainer().train()

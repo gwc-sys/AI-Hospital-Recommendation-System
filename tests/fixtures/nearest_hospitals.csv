@@ -1,0 +1,3 @@
+name,latitude,longitude,vicinity,phone_number,website,is_open_now,emergency_facility,quality_score,facility_type
+Near Hospital,18.5205,73.8568,Central Pune,111,https://near.example.com,True,True,90,hospital
+Far Hospital,18.6300,73.7990,Far Pune,222,https://far.example.com,True,True,95,hospital

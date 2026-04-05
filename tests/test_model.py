@@ -7,13 +7,26 @@ from src.model_training import HospitalModelTrainer
 def test_clean_dataset_adds_quality_score() -> None:
     df = pd.DataFrame(
         [
-            {"name": "A", "rating": "4.5", "reviews": "100", "specialty": "General"},
-            {"name": "B", "rating": "4.2", "reviews": "80", "specialty": "General"},
+            {"name": "A Hospital", "rating": "4.5", "reviews": "100", "specialty": "General", "facility_type": "hospital", "vicinity": "Pune"},
+            {"name": "B Hospital", "rating": "4.2", "reviews": "80", "specialty": "General", "facility_type": "hospital", "vicinity": "Pune"},
         ]
     )
     processed = HospitalDataProcessor().clean_dataset(df)
     assert "quality_score" in processed.columns
     assert processed["quality_score"].min() > 0
+
+
+def test_clean_dataset_removes_medical_store_and_laboratory_rows() -> None:
+    df = pd.DataFrame(
+        [
+            {"name": "Talera Hospital", "rating": "4.5", "reviews": "100", "specialty": "General", "facility_type": "hospital", "vicinity": "Chinchwad"},
+            {"name": "Omsainath Medical", "rating": "4.8", "reviews": "80", "specialty": "Pharmacy", "facility_type": "drugstore", "vicinity": "Pimpri"},
+            {"name": "United Pathology Laboratory", "rating": "4.0", "reviews": "50", "specialty": "General Practice", "facility_type": "hospital", "vicinity": "Moshi"},
+        ]
+    )
+    processed = HospitalDataProcessor().clean_dataset(df)
+
+    assert list(processed["name"]) == ["Talera Hospital"]
 
 
 def test_prepare_features_adds_model_columns() -> None:

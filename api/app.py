@@ -7,11 +7,11 @@ from __future__ import annotations
 from datetime import datetime
 from math import asin, cos, radians, sin, sqrt
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import joblib
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -30,6 +30,8 @@ FEATURE_NAMES = [
     "day_of_week",
     "distance_score",
 ]
+
+EXCLUDED_FACILITY_TERMS = {"pharmacy", "drugstore", "clinic", "medicare"}
 
 
 app = FastAPI(title="Hospital Recommendation API", version="1.0.0")
@@ -54,16 +56,36 @@ class RecommendationRequest(BaseModel):
 
 
 class HospitalRecommendation(BaseModel):
-    name: str
-    facility_type: str
-    distance_km: float
-    is_open: bool
+    hospital_name: str
+    type: str
+    latitude: float
+    longitude: float
+    address: str
+    open_now: bool
+    phone: str
+    website: str
+    emergency_facility: bool
     response_probability: float
-    has_emergency: bool
-    phone_number: str
+    distance: float
     recommendation_score: float
     ml_decision: str
     confidence: float
+
+
+class UserLocationDetails(BaseModel):
+    ip_address: str
+    forwarded_for: List[str]
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    city: Optional[str] = None
+    region: Optional[str] = None
+    country: Optional[str] = None
+    postal_code: Optional[str] = None
+    timezone: Optional[str] = None
+    accuracy_km: Optional[float] = None
+    source: str
+    precision: str
+    note: str
 
 
 class ModelManager:
@@ -164,6 +186,88 @@ def apply_priority_weights(data: pd.DataFrame, priority: str) -> pd.Series:
     )
 
 
+def get_client_ip(request: Request) -> str:
+    forwarded_for = request.headers.get("x-forwarded-for", "").split(",")
+    forwarded_for = [ip.strip() for ip in forwarded_for if ip.strip()]
+    if forwarded_for:
+        return forwarded_for[0]
+
+    if request.client and request.client.host:
+        return request.client.host
+
+    return "unknown"
+
+
+def get_forwarded_for_chain(request: Request) -> List[str]:
+    forwarded_for = request.headers.get("x-forwarded-for", "").split(",")
+    return [ip.strip() for ip in forwarded_for if ip.strip()]
+
+
+def _safe_float_header(value: Optional[str]) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_location_from_headers(request: Request) -> UserLocationDetails:
+    """
+    Build a best-effort location response from proxy/CDN headers.
+
+    Precise device GPS coordinates cannot be determined by the backend alone unless the
+    client sends them explicitly after user consent.
+    """
+    headers = request.headers
+    latitude = _safe_float_header(headers.get("x-user-latitude") or headers.get("cf-iplatitude"))
+    longitude = _safe_float_header(headers.get("x-user-longitude") or headers.get("cf-iplongitude"))
+
+    city = headers.get("x-user-city") or headers.get("x-vercel-ip-city") or headers.get("cf-ipcity")
+    region = (
+        headers.get("x-user-region")
+        or headers.get("x-vercel-ip-country-region")
+        or headers.get("cf-region")
+    )
+    country = (
+        headers.get("x-user-country")
+        or headers.get("x-vercel-ip-country")
+        or headers.get("cf-ipcountry")
+    )
+    postal_code = headers.get("x-user-postal-code") or headers.get("x-vercel-ip-postal-code")
+    timezone = headers.get("x-user-timezone") or headers.get("x-vercel-ip-timezone") or headers.get("cf-timezone")
+    accuracy_km = _safe_float_header(headers.get("x-user-location-accuracy-km"))
+
+    if latitude is not None and longitude is not None:
+        source = "client_coordinates"
+        precision = "precise"
+        note = "Coordinates were supplied by the client request headers."
+    elif any([city, region, country, postal_code, timezone]):
+        source = "proxy_geo_headers"
+        precision = "approximate"
+        note = "Location was inferred from proxy or hosting provider geo headers and may be approximate."
+    else:
+        source = "ip_only"
+        precision = "unknown"
+        note = "Backend can only see IP/request metadata here. Exact GPS location requires coordinates from the client."
+
+    return UserLocationDetails(
+        ip_address=get_client_ip(request),
+        forwarded_for=get_forwarded_for_chain(request),
+        latitude=latitude,
+        longitude=longitude,
+        city=city,
+        region=region,
+        country=country,
+        postal_code=postal_code,
+        timezone=timezone,
+        accuracy_km=accuracy_km,
+        source=source,
+        precision=precision,
+        note=note,
+    )
+
+
 def build_feature_frame(data: pd.DataFrame) -> pd.DataFrame:
     collected_at = pd.to_datetime(data["collected_at"], errors="coerce")
     max_distance = data["distance_km"].max()
@@ -186,14 +290,36 @@ def build_feature_frame(data: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def filter_hospital_candidates(data: pd.DataFrame) -> pd.DataFrame:
+    facility_types = data["facility_type"].fillna("").astype(str).str.lower()
+    name_values = data["name"].fillna("").astype(str).str.lower()
+    excluded_pattern = "|".join(sorted(EXCLUDED_FACILITY_TERMS))
+
+    excluded = facility_types.str.contains(excluded_pattern, na=False) | name_values.str.contains(
+        excluded_pattern,
+        na=False,
+    )
+    hospital_like = facility_types.isin({"hospital", "health"}) | name_values.str.contains(
+        "hospital",
+        na=False,
+    )
+    return data[hospital_like & ~excluded].copy()
+
+
 @app.get("/")
 async def root() -> dict:
     return {
         "status": "ok",
         "message": "Hospital Recommendation System API",
         "version": "1.0.0",
-        "endpoints": ["/recommend", "/health", "/stats"],
+        "endpoints": ["/recommend", "/health", "/stats", "/location/current"],
     }
+
+
+@app.get("/location/current", response_model=UserLocationDetails)
+async def get_current_user_location(request: Request) -> UserLocationDetails:
+    """Return best-effort current user location details from request metadata."""
+    return extract_location_from_headers(request)
 
 
 @app.post("/recommend", response_model=List[HospitalRecommendation])
@@ -203,7 +329,7 @@ async def get_recommendations(request: RecommendationRequest) -> List[HospitalRe
         if manager.data.empty:
             raise HTTPException(status_code=503, detail="Hospital dataset is not available.")
 
-        candidates = manager.data.copy()
+        candidates = filter_hospital_candidates(manager.data.copy())
         candidates["distance_km"] = candidates.apply(
             lambda row: calculate_distance_km(
                 request.latitude,
@@ -253,13 +379,17 @@ async def get_recommendations(request: RecommendationRequest) -> List[HospitalRe
 
         return [
             HospitalRecommendation(
-                name=str(row["name"]),
-                facility_type=str(row.get("facility_type", "hospital")),
-                distance_km=round(float(row["distance_km"]), 3),
-                is_open=bool(row.get("is_open_now", False)),
+                hospital_name=str(row["name"]),
+                type=str(row.get("facility_type", "hospital")),
+                latitude=float(row.get("latitude", 0.0)),
+                longitude=float(row.get("longitude", 0.0)),
+                address=str(row.get("vicinity", "N/A")),
+                open_now=bool(row.get("is_open_now", False)),
+                phone=str(row.get("phone_number", "N/A")),
+                website=str(row.get("website", "N/A")),
+                emergency_facility=bool(row.get("emergency_facility", False)),
                 response_probability=round(float(row.get("response_probability", 0.0)), 3),
-                has_emergency=bool(row.get("emergency_facility", False)),
-                phone_number=str(row.get("phone_number", "N/A")),
+                distance=round(float(row["distance_km"]), 3),
                 recommendation_score=round(float(row["recommendation_score"]), 3),
                 ml_decision=str(row["ml_decision"]),
                 confidence=round(float(row["confidence"]), 3),
