@@ -6,4 +6,6 @@ __pycache__/
 models/*.pkl
 logs/*.log
 data/backups/
+*firebase-adminsdk*.json
+*service-account*.json
 
