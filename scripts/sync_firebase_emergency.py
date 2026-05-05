@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import sys
 
@@ -45,9 +46,13 @@ def main() -> None:
         "--watch",
         action="store_true",
         help=(
-            "Watch Firebase for SOS changes, sync the current latest SOS on startup, "
-            "and automatically reconnect if the listener drops."
+            "Watch Firebase for SOS changes and automatically reconnect if the listener drops."
         ),
+    )
+    parser.add_argument(
+        "--sync-on-startup",
+        action="store_true",
+        help="Also sync the current latest SOS once on startup before waiting for new button presses.",
     )
     parser.add_argument(
         "--poll-interval",
@@ -71,7 +76,10 @@ def main() -> None:
             "Press Ctrl+C to stop."
         )
         try:
-            sync.watch_sos(poll_interval_seconds=args.poll_interval)
+            sync.watch_sos(
+                poll_interval_seconds=args.poll_interval,
+                sync_on_startup=args.sync_on_startup,
+            )
         except Exception as exc:
             raise SystemExit(format_runtime_error(exc)) from exc
         return
@@ -81,7 +89,7 @@ def main() -> None:
     except Exception as exc:
         raise SystemExit(format_runtime_error(exc)) from exc
 
-    print(payload)
+    print(json.dumps(payload, ensure_ascii=True))
 
 
 if __name__ == "__main__":

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import logging
+import os
 from pathlib import Path
 from typing import Any
 
 import joblib
 import pandas as pd
+from dotenv import load_dotenv
 
 from src.utils import DATA_DIR, MODELS_DIR
 
@@ -23,12 +26,17 @@ FEATURE_NAMES = [
 
 COMPARED_PARAMETERS = [
     "distance_km",
+    "specialization",
     "open_now",
     "emergency_available",
+    "emergency_facility",
     "phone_available",
     "response_time_sec",
     "response_probability",
 ]
+
+logger = logging.getLogger(__name__)
+load_dotenv()
 
 
 def calculate_distance_km(
@@ -56,19 +64,59 @@ class EmergencyHospitalRecommender:
     """Prepare Firebase-ready emergency payloads for the React Native app."""
 
     EXCLUDED_FACILITY_TERMS = {"pharmacy", "drugstore", "clinic", "medicare"}
+    LIVE_EXCLUDED_NAME_TERMS = {
+        "medical store",
+        "pharmacy",
+        "chemist",
+        "clinic",
+        "laboratory",
+        "diagnostic",
+        "engineers",
+    }
     CANDIDATE_POOL_SIZE = 12
+    LIVE_SEARCH_RADIUS_METERS = 5000
+    LOCAL_DATASET_NEARBY_RADIUS_KM = 20.0
+    SELECTION_PROFILES = {
+        "balanced": {
+            "distance_score": 0.22,
+            "response_time_score": 0.18,
+            "open_now": 0.18,
+            "emergency_available": 0.18,
+            "phone_available": 0.10,
+            "response_probability": 0.08,
+            "quality_score_norm": 0.04,
+            "facility_priority": 0.02,
+        },
+        "best_of_best": {
+            # Nearest + best quality: keep distance dominant while still preferring top hospitals.
+            "distance_score": 0.36,
+            "response_time_score": 0.14,
+            "open_now": 0.10,
+            "emergency_available": 0.14,
+            "phone_available": 0.04,
+            "response_probability": 0.10,
+            "quality_score_norm": 0.10,
+            "facility_priority": 0.02,
+        },
+    }
 
     def __init__(
         self,
         dataset_path: Path | str | None = None,
         model_dir: Path | str | None = None,
         use_models: bool = True,
+        live_lookup_enabled: bool | None = None,
     ) -> None:
         self.dataset_path = Path(dataset_path) if dataset_path else DATA_DIR / "processed" / "final_hospital_dataset.csv"
         self.model_dir = Path(model_dir) if model_dir else MODELS_DIR
         self.feature_names = FEATURE_NAMES
         self.classifier = None
         self.regressor = None
+        self.live_lookup_enabled = (
+            bool(live_lookup_enabled)
+            if live_lookup_enabled is not None
+            else dataset_path is None
+        )
         self.model_status = "disabled"
         if use_models:
             self._load_models()
@@ -108,6 +156,117 @@ class EmergencyHospitalRecommender:
             if column not in data.columns:
                 data[column] = default_value
         return data
+
+    def _looks_like_real_hospital(self, hospital_name: Any, facility_type: Any) -> bool:
+        normalized_name = str(hospital_name or "").strip().lower()
+        normalized_type = str(facility_type or "").strip().lower()
+
+        if any(term in normalized_name for term in self.LIVE_EXCLUDED_NAME_TERMS):
+            return False
+        if normalized_type in {"hospital", "health"}:
+            return True
+        return "hospital" in normalized_name
+
+    def _enrich_hospital_defaults(self, data: pd.DataFrame) -> pd.DataFrame:
+        defaults = {
+            "facility_type": "hospital",
+            "emergency_facility": False,
+            "is_open_now": False,
+            "phone_number": "N/A",
+            "website": "N/A",
+            "vicinity": "N/A",
+            "response_probability": 0.5,
+            "quality_score": 0.0,
+            "has_phone": 0,
+            "has_website": 0,
+        }
+        enriched = data.copy()
+        for column, default_value in defaults.items():
+            if column not in enriched.columns:
+                enriched[column] = default_value
+
+        quality_score_series = pd.to_numeric(
+            enriched.get("quality_score", pd.Series(index=enriched.index, dtype="float64")),
+            errors="coerce",
+        )
+        rating_series = pd.to_numeric(
+            enriched.get("rating", pd.Series(index=enriched.index, dtype="float64")),
+            errors="coerce",
+        )
+        enriched["quality_score"] = quality_score_series.fillna(rating_series).fillna(0.0).clip(lower=0.0)
+        return enriched
+
+    def _load_live_hospitals(self, latitude: float, longitude: float) -> pd.DataFrame:
+        api_key = os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
+        if not api_key:
+            try:
+                from config.api_config import API_KEY
+
+                api_key = str(API_KEY or "").strip()
+            except Exception:
+                api_key = ""
+        if not api_key:
+            return pd.DataFrame()
+
+        try:
+            from src.data_collection import GoogleMapsCollector
+
+            collector = GoogleMapsCollector(api_key=api_key)
+            live_data = collector.collect_hospitals(
+                location=(latitude, longitude),
+                radius=self.LIVE_SEARCH_RADIUS_METERS,
+                search_points=[(latitude, longitude)],
+                search_label="live_location",
+            )
+        except Exception as exc:
+            logger.warning("Live hospital lookup failed, falling back to dataset: %s", exc)
+            return pd.DataFrame()
+
+        if live_data.empty:
+            return live_data
+
+        filtered = live_data[
+            live_data.apply(
+                lambda row: self._looks_like_real_hospital(
+                    hospital_name=row.get("name"),
+                    facility_type=row.get("facility_type"),
+                ),
+                axis=1,
+            )
+        ].copy()
+        return self._enrich_hospital_defaults(filtered)
+
+    def _load_nearby_dataset_hospitals(self, latitude: float, longitude: float) -> pd.DataFrame:
+        dataset_data = self._enrich_hospital_defaults(self._load_dataset())
+        dataset_data = self._filter_hospital_rows(dataset_data)
+        if dataset_data.empty:
+            return dataset_data
+
+        dataset_data = dataset_data.copy()
+        dataset_data["distance_km"] = dataset_data.apply(
+            lambda row: calculate_distance_km(
+                latitude,
+                longitude,
+                float(row["latitude"]),
+                float(row["longitude"]),
+            ),
+            axis=1,
+        )
+        nearby = dataset_data[dataset_data["distance_km"] <= self.LOCAL_DATASET_NEARBY_RADIUS_KM].copy()
+        return nearby.sort_values("distance_km", ascending=True).reset_index(drop=True)
+
+    def _load_hospitals_for_location(self, latitude: float, longitude: float) -> tuple[pd.DataFrame, str]:
+        nearby_dataset = self._load_nearby_dataset_hospitals(latitude, longitude)
+        if not nearby_dataset.empty:
+            return nearby_dataset, "dataset_csv_nearby"
+
+        if self.live_lookup_enabled:
+            live_data = self._load_live_hospitals(latitude, longitude)
+            if not live_data.empty:
+                return live_data, "live_google_maps"
+
+        dataset_data = self._enrich_hospital_defaults(self._load_dataset())
+        return dataset_data, "dataset_csv"
 
     @staticmethod
     def _clean_text(value: Any, fallback: str = "N/A") -> str:
@@ -317,24 +476,37 @@ class EmergencyHospitalRecommender:
         ranked["ml_decision"] = classifier_decision
         return ranked
 
-    def _apply_parameter_scores(self, candidates: pd.DataFrame) -> pd.DataFrame:
+    def _apply_parameter_scores(
+        self,
+        candidates: pd.DataFrame,
+        selection_preference: str = "balanced",
+    ) -> pd.DataFrame:
         ranked = candidates.copy()
+        normalized = str(selection_preference or "balanced").strip().lower()
+        profile = self.SELECTION_PROFILES.get(normalized, self.SELECTION_PROFILES["balanced"])
         ranked["parameter_score"] = (
-            ranked["distance_score"] * 0.22
-            + ranked["response_time_score"] * 0.18
-            + ranked["open_now"].astype(int) * 0.18
-            + ranked["emergency_available"].astype(int) * 0.18
-            + ranked["phone_available"].astype(int) * 0.10
-            + ranked["response_probability"] * 0.08
-            + ranked["quality_score_norm"] * 0.04
-            + ranked["facility_priority"] * 0.02
+            ranked["distance_score"] * profile["distance_score"]
+            + ranked["response_time_score"] * profile["response_time_score"]
+            + ranked["open_now"].astype(int) * profile["open_now"]
+            + ranked["emergency_available"].astype(int) * profile["emergency_available"]
+            + ranked["phone_available"].astype(int) * profile["phone_available"]
+            + ranked["response_probability"] * profile["response_probability"]
+            + ranked["quality_score_norm"] * profile["quality_score_norm"]
+            + ranked["facility_priority"] * profile["facility_priority"]
         ).clip(0, 1)
         return ranked
 
-    def _rank_emergency_candidates(self, hospitals: pd.DataFrame) -> pd.DataFrame:
+    def _rank_emergency_candidates(
+        self,
+        hospitals: pd.DataFrame,
+        selection_preference: str = "balanced",
+    ) -> pd.DataFrame:
         ranked = self._prepare_candidate_pool(hospitals)
         ranked = self._apply_model_scores(ranked)
-        ranked = self._apply_parameter_scores(ranked)
+        ranked = self._apply_parameter_scores(
+            ranked,
+            selection_preference=selection_preference,
+        )
 
         if self.classifier is not None or self.regressor is not None:
             ranked["selection_method"] = "decision_tree_hybrid"
@@ -361,11 +533,15 @@ class EmergencyHospitalRecommender:
             "hospital_name": self._clean_text(hospital_row["name"]),
             "distance_km": round(float(hospital_row["distance_km"]), 3),
             "address": self._clean_text(hospital_row.get("vicinity", "N/A")),
+            "specialization": self._clean_text(hospital_row.get("specialty", "General"), fallback="General"),
             "phone": self._clean_text(hospital_row.get("phone_number", "N/A")),
             "website": self._clean_text(hospital_row.get("website", "N/A")),
             "open_now": bool(hospital_row.get("open_now", hospital_row.get("is_open_now", False))),
             "emergency_available": bool(
                 hospital_row.get("emergency_available", hospital_row.get("emergency_facility", False))
+            ),
+            "emergency_facility": bool(
+                hospital_row.get("emergency_facility", hospital_row.get("emergency_available", False))
             ),
             "phone_available": bool(hospital_row.get("phone_available", 0)),
             "website_available": bool(hospital_row.get("website_available", 0)),
@@ -407,8 +583,9 @@ class EmergencyHospitalRecommender:
         longitude: float,
         require_emergency: bool = False,
         only_open: bool = False,
+        selection_preference: str = "balanced",
     ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
-        hospitals = self._load_dataset().copy()
+        hospitals, data_source = self._load_hospitals_for_location(latitude, longitude)
         hospitals = self._filter_hospital_rows(hospitals)
         hospitals["distance_km"] = hospitals.apply(
             lambda row: calculate_distance_km(
@@ -428,7 +605,14 @@ class EmergencyHospitalRecommender:
         if hospitals.empty:
             raise ValueError("No hospitals matched the emergency filters.")
 
-        ranked = self._rank_emergency_candidates(hospitals)
+        normalized_preference = str(selection_preference or "balanced").strip().lower()
+        if normalized_preference not in self.SELECTION_PROFILES:
+            normalized_preference = "balanced"
+
+        ranked = self._rank_emergency_candidates(
+            hospitals,
+            selection_preference=normalized_preference,
+        )
         best = ranked.iloc[0]
         best_reason = (
             "Best nearby hospital after comparing distance, open status, emergency availability, "
@@ -446,12 +630,14 @@ class EmergencyHospitalRecommender:
             "primary_algorithm": "Decision Tree / Simple ML model",
             "selection_method": self._clean_text(best.get("selection_method", "weighted_parameter_fallback")),
             "model_status": self.model_status,
+            "data_source": data_source,
             "fallback_system": "Weighted parameter scoring fallback",
             "fallback_used": bool(best.get("fallback_used", False)),
             "compared_parameters": COMPARED_PARAMETERS,
             "response_time_source": "estimated_from_distance_and_readiness",
             "compared_hospitals": int(len(nearby_options)),
             "candidate_pool_size": int(len(ranked)),
+            "selection_preference": normalized_preference,
         }
         return (
             self._build_hospital_payload(best, reason=best_reason, rank_position=1),
@@ -465,12 +651,14 @@ class EmergencyHospitalRecommender:
         longitude: float,
         require_emergency: bool = False,
         only_open: bool = False,
+        selection_preference: str = "balanced",
     ) -> dict[str, Any]:
         best_hospital, _, _ = self.find_best_hospital_options(
             latitude=latitude,
             longitude=longitude,
             require_emergency=require_emergency,
             only_open=only_open,
+            selection_preference=selection_preference,
         )
         return best_hospital
 
@@ -498,12 +686,25 @@ class EmergencyHospitalRecommender:
             longitude=longitude,
             require_emergency=require_emergency,
             only_open=only_open,
+            selection_preference=str(emergency_event.get("selection_preference", "balanced")),
         )
 
         timestamp = emergency_event.get("last_updated") or datetime.now(timezone.utc).isoformat()
         sos_type = emergency_event.get("type", "SOS Emergency")
         priority = emergency_event.get("priority", "CRITICAL")
         device_name = emergency_event.get("device_name", "Ai-based-smart-vehicle-health")
+        selected_at = datetime.now(timezone.utc).isoformat()
+        assigned_hospital = {
+            "hospital_name": hospital["hospital_name"],
+            "distance_km": hospital["distance_km"],
+            "address": hospital["address"],
+            "specialization": hospital["specialization"],
+            "phone": hospital["phone"],
+            "emergency_available": hospital["emergency_available"],
+            "emergency_facility": hospital["emergency_facility"],
+            "map_url": hospital["map_url"],
+            "selected_at": selected_at,
+        }
 
         return {
             "sos_alert": {
@@ -516,11 +717,20 @@ class EmergencyHospitalRecommender:
                 "location": location_payload,
                 "health": emergency_event.get("health", {}),
                 "refresh_metadata": refresh_metadata,
+                "assigned_hospital": assigned_hospital,
+                # Legacy flat keys for clients expecting hospital fields directly under sos_alert.
+                "hospital_name": assigned_hospital["hospital_name"],
+                "distance_km": assigned_hospital["distance_km"],
+                "address": assigned_hospital["address"],
+                "specialization": assigned_hospital["specialization"],
+                "hospital_phone": assigned_hospital["phone"],
+                "emergency_available": assigned_hospital["emergency_available"],
+                "emergency_facility": assigned_hospital["emergency_facility"],
             },
             "ai_results": {
                 "hospital_ai": {
                     **hospital,
-                    "selected_at": datetime.now(timezone.utc).isoformat(),
+                    "selected_at": selected_at,
                     "ui_card_title": "Find Hospital",
                     "ui_card_subtitle": "Best hospital after AI comparison",
                 },
@@ -528,4 +738,6 @@ class EmergencyHospitalRecommender:
                 "hospital_selection": selection_metadata,
                 "payload_refresh": refresh_metadata,
             },
+            # Legacy top-level snapshot for clients that do not read nested ai_results.
+            "assigned_hospital_from_firebase": assigned_hospital,
         }

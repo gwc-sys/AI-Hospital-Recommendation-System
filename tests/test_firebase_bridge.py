@@ -44,13 +44,13 @@ def test_build_payload_from_nodes_uses_alert_location_and_health_metrics() -> No
 
     assert payload["sos_alert"]["type"] == "SOS: Tilt/fall detected"
     assert payload["sos_alert"]["location"]["latitude"] == 18.675943
-    assert payload["sos_alert"]["location"]["source"] == "vehicle_gps"
+    assert payload["sos_alert"]["location"]["source"] == "alert"
     assert payload["sos_alert"]["health"]["heart_rate_bpm"] == 166
     assert payload["sos_alert"]["health"]["spo2"] == 100
     assert payload["ai_results"]["hospital_ai"]["hospital_name"] == "Emergency Hospital"
     assert payload["ai_results"]["payload_refresh"]["alert_key"] == "2056828"
     assert payload["ai_results"]["payload_refresh"]["refresh_trigger"] == "new_sos"
-    assert payload["sos_alert"]["refresh_metadata"]["sos_signature"].startswith("2056828|")
+    assert "alert_marker" not in payload["sos_alert"]["refresh_metadata"]
 
 
 def test_build_payload_from_nodes_falls_back_to_vehicle_gps() -> None:
@@ -135,7 +135,7 @@ def test_build_payload_from_nodes_uses_latest_valid_health_metrics() -> None:
     assert payload["sos_alert"]["health"]["spo2"] == 100
 
 
-def test_build_payload_from_nodes_prefers_newer_vehicle_location_over_older_alert_location() -> None:
+def test_build_payload_from_nodes_prefers_alert_location_over_vehicle_location() -> None:
     sync = FirebaseEmergencySync(dataset_path="tests/fixtures/single_emergency_hospital.csv")
 
     vehicle_root = {
@@ -161,9 +161,10 @@ def test_build_payload_from_nodes_prefers_newer_vehicle_location_over_older_aler
 
     payload = sync.build_payload_from_nodes(vehicle_root, alerts_root, health_root)
 
-    assert payload["sos_alert"]["location"]["latitude"] == 18.675617
-    assert payload["sos_alert"]["location"]["longitude"] == 73.841995
-    assert payload["sos_alert"]["location"]["source"] == "vehicle_gps"
+    assert payload["sos_alert"]["location"]["latitude"] == 18.675500
+    assert payload["sos_alert"]["location"]["longitude"] == 73.841900
+    assert payload["sos_alert"]["location"]["source"] == "alert"
+    assert "alert_marker" not in payload["ai_results"]["payload_refresh"]
 
 
 def test_sync_and_log_sos_reports_updated_hospital(capsys) -> None:
@@ -184,7 +185,6 @@ def test_sync_and_log_sos_reports_updated_hospital(capsys) -> None:
         "ai_results": {
             "payload_refresh": {
                 "refreshed_at": "2026-04-05T10:00:37Z",
-                "sos_signature": "2056828|2056|SOS: Tilt/fall detected|18.675943|73.841827|sos",
             },
             "hospital_ai": {
                 "hospital_name": "Emergency Hospital",
@@ -233,7 +233,6 @@ def test_format_sos_console_output_includes_payload_details() -> None:
             "ai_results": {
                 "payload_refresh": {
                     "refreshed_at": "2026-04-05T10:00:37Z",
-                    "sos_signature": "2056828|2056|SOS: Tilt/fall detected|18.675943|73.841827|sos",
                 },
                 "hospital_ai": {
                     "hospital_name": "Emergency Hospital",
@@ -250,11 +249,12 @@ def test_format_sos_console_output_includes_payload_details() -> None:
     assert "Event path: /poll" in output
     assert "Heart rate: 166" in output
     assert "Refreshed at: 2026-04-05T10:00:37Z" in output
+    assert "Alert marker" not in output
     assert "Recommended hospital: Emergency Hospital" in output
     assert '"hospital_name": "Emergency Hospital"' in output
 
 
-def test_sync_latest_sos_if_needed_only_marks_signature_after_sync() -> None:
+def test_sync_latest_sos_if_needed_only_marks_alert_after_sync() -> None:
     sync = FirebaseEmergencySync(dataset_path="tests/fixtures/single_emergency_hospital.csv")
     calls: list[tuple[str, str]] = []
 
@@ -270,44 +270,19 @@ def test_sync_latest_sos_if_needed_only_marks_signature_after_sync() -> None:
         "type": "sos",
     }
 
-    first_signature = sync._sync_latest_sos_if_needed(
+    first_marker = sync._sync_latest_sos_if_needed(
         "2056828",
         latest_sos,
         "/poll",
-        last_synced_signature="",
+        last_synced_marker="",
     )
-    second_signature = sync._sync_latest_sos_if_needed(
+    second_marker = sync._sync_latest_sos_if_needed(
         "2056828",
         latest_sos,
         "/poll",
-        last_synced_signature=first_signature,
+        last_synced_marker=first_marker,
     )
 
-    assert first_signature == FirebaseEmergencySync.build_sos_signature("2056828", latest_sos)
-    assert second_signature == first_signature
+    assert first_marker == "2056828|2056"
+    assert second_marker == first_marker
     assert calls == [("2056828", "/poll")]
-
-
-def test_build_sos_signature_changes_when_location_changes() -> None:
-    first = FirebaseEmergencySync.build_sos_signature(
-        "4615838",
-        {
-            "timestamp": 4615,
-            "message": "Manual SOS button pressed",
-            "latitude": 18.675943,
-            "longitude": 73.841827,
-            "type": "sos",
-        },
-    )
-    second = FirebaseEmergencySync.build_sos_signature(
-        "4615838",
-        {
-            "timestamp": 4615,
-            "message": "Manual SOS button pressed",
-            "latitude": 18.676500,
-            "longitude": 73.842000,
-            "type": "sos",
-        },
-    )
-
-    assert first != second

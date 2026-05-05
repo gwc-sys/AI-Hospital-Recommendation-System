@@ -1,4 +1,5 @@
 from src.emergency_response import EmergencyHospitalRecommender
+import pandas as pd
 
 
 def test_find_nearest_hospital_returns_closest_row() -> None:
@@ -96,8 +97,10 @@ def test_build_react_native_payload_includes_ranked_nearby_hospitals() -> None:
     assert "Closed Doctor Hospital" in nearby_names
     assert payload["ai_results"]["hospital_selection"]["compared_parameters"] == [
         "distance_km",
+        "specialization",
         "open_now",
         "emergency_available",
+        "emergency_facility",
         "phone_available",
         "response_time_sec",
         "response_probability",
@@ -131,3 +134,63 @@ def test_build_react_native_payload_uses_parameter_fallback_when_models_disabled
     assert payload["ai_results"]["hospital_selection"]["fallback_used"] is True
     assert payload["ai_results"]["hospital_selection"]["selection_method"] == "weighted_parameter_fallback"
     assert payload["ai_results"]["hospital_ai"]["selection_method"] == "weighted_parameter_fallback"
+
+
+def test_load_hospitals_for_location_prefers_local_dataset_before_live_lookup() -> None:
+    recommender = EmergencyHospitalRecommender(
+        dataset_path="tests/fixtures/nearest_hospitals.csv",
+        live_lookup_enabled=True,
+    )
+    calls = {"count": 0}
+
+    def fake_live_lookup(latitude: float, longitude: float) -> pd.DataFrame:
+        calls["count"] += 1
+        return pd.DataFrame(
+            [
+                {
+                    "name": "Live API Hospital",
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "facility_type": "hospital",
+                }
+            ]
+        )
+
+    recommender._load_live_hospitals = fake_live_lookup  # type: ignore[method-assign]
+
+    hospitals, data_source = recommender._load_hospitals_for_location(18.5204, 73.8567)
+
+    assert calls["count"] == 0
+    assert data_source == "dataset_csv_nearby"
+    assert not hospitals.empty
+
+
+def test_load_hospitals_for_location_calls_live_lookup_when_no_local_nearby_hospitals() -> None:
+    recommender = EmergencyHospitalRecommender(
+        dataset_path="tests/fixtures/nearest_hospitals.csv",
+        live_lookup_enabled=True,
+    )
+    calls = {"count": 0}
+
+    def fake_live_lookup(latitude: float, longitude: float) -> pd.DataFrame:
+        calls["count"] += 1
+        return pd.DataFrame(
+            [
+                {
+                    "name": "Live API Hospital",
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "facility_type": "hospital",
+                    "is_open_now": True,
+                    "emergency_facility": True,
+                }
+            ]
+        )
+
+    recommender._load_live_hospitals = fake_live_lookup  # type: ignore[method-assign]
+
+    hospitals, data_source = recommender._load_hospitals_for_location(0.0, 0.0)
+
+    assert calls["count"] == 1
+    assert data_source == "live_google_maps"
+    assert hospitals.iloc[0]["name"] == "Live API Hospital"

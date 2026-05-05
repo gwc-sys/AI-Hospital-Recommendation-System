@@ -111,10 +111,11 @@ class FirebaseEmergencySync:
         return number
 
     def build_payload(self, document: dict[str, Any]) -> dict[str, Any]:
+        preferences = document.get("preferences", {})
         return self.recommender.build_react_native_payload(
             emergency_event=document.get("sos_alert", {}),
-            require_emergency=bool(document.get("preferences", {}).get("require_emergency", False)),
-            only_open=bool(document.get("preferences", {}).get("only_open", False)),
+            require_emergency=bool(preferences.get("require_emergency", False)),
+            only_open=bool(preferences.get("only_open", False)),
         )
 
     def build_payload_from_nodes(
@@ -155,13 +156,12 @@ class FirebaseEmergencySync:
         latitude = alert_latitude
         longitude = alert_longitude
 
-        if vehicle_latitude is not None and vehicle_longitude is not None:
-            alert_timestamp = self._valid_number(latest_sos.get("timestamp")) or -1
-            vehicle_timestamp = self._valid_number(latest_vehicle_gps.get("timestamp")) or -1
-            if latitude is None or longitude is None or vehicle_timestamp >= alert_timestamp:
-                latitude = vehicle_latitude
-                longitude = vehicle_longitude
-                latest_location_source = "vehicle_gps"
+        # Prefer the SOS alert coordinates as the real trigger location.
+        # Only fall back to vehicle GPS if SOS alert coordinates are missing.
+        if (latitude is None or longitude is None) and vehicle_latitude is not None and vehicle_longitude is not None:
+            latitude = vehicle_latitude
+            longitude = vehicle_longitude
+            latest_location_source = "vehicle_gps"
 
         if latitude is None or longitude is None:
             raise ValueError("No usable GPS coordinates found in alerts or vehicle readings.")
@@ -191,7 +191,6 @@ class FirebaseEmergencySync:
             "vehicle_timestamp": latest_vehicle.get("timestamp"),
             "health_reading_key": latest_health_key,
             "health_timestamp": latest_health.get("timestamp"),
-            "sos_signature": self.build_sos_signature(latest_sos_key, latest_sos),
         }
 
         emergency_event = {
@@ -201,6 +200,15 @@ class FirebaseEmergencySync:
             "device_name": latest_sos.get("device_id", settings.vehicle_node),
             "last_updated": latest_sos.get("timestamp"),
             "trigger_source": latest_sos.get("type", "sos"),
+            "selection_preference": (
+                str(
+                    latest_sos.get("selection_preference")
+                    or latest_sos.get("hospital_choice")
+                    or "balanced"
+                )
+                .strip()
+                .lower()
+            ),
             "location": {
                 "latitude": latitude,
                 "longitude": longitude,
@@ -241,7 +249,66 @@ class FirebaseEmergencySync:
         payload = self.build_payload_from_nodes(vehicle_root, alerts_root, health_root)
         response_ref = self.db.reference(settings.response_path)
         response_ref.set(payload)
+        self._update_latest_alert_assignment(payload)
         return payload
+
+    def _update_latest_alert_assignment(self, payload: dict[str, Any]) -> None:
+        if self.db is None:
+            return
+
+        refresh = payload.get("ai_results", {}).get("payload_refresh", {})
+        sos_alert = payload.get("sos_alert", {})
+        alert_key = str(refresh.get("alert_key", "")).strip()
+        if not alert_key:
+            return
+
+        hospital = payload.get("ai_results", {}).get("hospital_ai", {})
+        if not hospital:
+            return
+
+        assignment = {
+            "hospital_name": hospital.get("hospital_name", "Nearest hospital"),
+            "distance_km": hospital.get("distance_km"),
+            "address": hospital.get("address", "Address not available"),
+            "specialization": hospital.get("specialization", "General"),
+            "hospital_phone": hospital.get("phone", "N/A"),
+            "emergency_available": hospital.get("emergency_available"),
+            "emergency_facility": hospital.get("emergency_facility"),
+            "map_url": hospital.get("map_url"),
+            "selected_at": hospital.get("selected_at"),
+            "selection_method": hospital.get("selection_method"),
+            "source": "ai_emergency_sync",
+        }
+        refresh_flat = {
+            "refresh_trigger": refresh.get("refresh_trigger"),
+            "refreshed_at": refresh.get("refreshed_at"),
+            "vehicle_reading_key": refresh.get("vehicle_reading_key"),
+            "vehicle_timestamp": refresh.get("vehicle_timestamp"),
+            "health_reading_key": refresh.get("health_reading_key"),
+            "health_timestamp": refresh.get("health_timestamp"),
+            "alert_timestamp": refresh.get("alert_timestamp"),
+        }
+        sos_flat = {
+            "active": sos_alert.get("active"),
+            "type": sos_alert.get("type"),
+            "trigger_source": sos_alert.get("trigger_source"),
+            "priority": sos_alert.get("priority"),
+            "device_name": sos_alert.get("device_name"),
+            "last_updated": sos_alert.get("last_updated"),
+            "location": sos_alert.get("location"),
+            "health": sos_alert.get("health"),
+        }
+
+        alert_ref = self.db.reference(f"{settings.alerts_node.strip('/')}/{alert_key}")
+        alert_ref.update(
+            {
+                "assigned_hospital": assignment,
+                "refresh_metadata": refresh,
+                **assignment,
+                **refresh_flat,
+                **sos_flat,
+            }
+        )
 
     def get_latest_sos_details(self) -> tuple[str, dict[str, Any]]:
         if self.db is None:
@@ -257,15 +324,11 @@ class FirebaseEmergencySync:
         return latest_key, latest_sos
 
     @staticmethod
-    def build_sos_signature(alert_key: str, alert: dict[str, Any]) -> str:
+    def _build_alert_dedupe_key(alert_key: str, alert: dict[str, Any]) -> str:
         return "|".join(
             [
                 str(alert_key or ""),
                 str(alert.get("timestamp", "")),
-                str(alert.get("message", "")),
-                str(alert.get("latitude", "")),
-                str(alert.get("longitude", "")),
-                str(alert.get("type", "")),
             ]
         )
 
@@ -317,7 +380,6 @@ class FirebaseEmergencySync:
             f"[SOS] Heart rate: {cls._format_console_value(health.get('heart_rate_bpm'))}",
             f"[SOS] SpO2: {cls._format_console_value(health.get('spo2'))}",
             f"[SOS] Refreshed at: {cls._format_console_value(refresh.get('refreshed_at'))}",
-            f"[SOS] SOS signature: {cls._format_console_value(refresh.get('sos_signature'))}",
             (
                 "[SOS] Recommended hospital: "
                 f"{cls._format_console_value(hospital.get('hospital_name'), 'Unknown hospital')}"
@@ -361,22 +423,27 @@ class FirebaseEmergencySync:
         alert_key: str,
         latest_sos: dict[str, Any],
         event_path: str,
-        last_synced_signature: str,
+        last_synced_marker: str,
+        ignore_marker: bool = False,
     ) -> str:
-        current_signature = self.build_sos_signature(alert_key, latest_sos)
-        if current_signature == last_synced_signature:
-            return last_synced_signature
+        current_marker = self._build_alert_dedupe_key(alert_key, latest_sos)
+        if not ignore_marker and current_marker == last_synced_marker:
+            return last_synced_marker
 
         self._sync_and_log_sos(
             alert_key=alert_key,
             latest_sos=latest_sos,
             event_path=event_path,
         )
-        return current_signature
+        return current_marker
 
-    def watch_sos(self, poll_interval_seconds: float = 2.0) -> None:
+    def watch_sos(
+        self,
+        poll_interval_seconds: float = 2.0,
+        sync_on_startup: bool = False,
+    ) -> None:
         heartbeat_interval = max(float(poll_interval_seconds), 1.0)
-        last_synced_signature = ""
+        last_synced_marker = ""
 
         while True:
             listener = None
@@ -394,14 +461,14 @@ class FirebaseEmergencySync:
                         f"timestamp={latest_sos.get('timestamp', 'unknown')}",
                         flush=True,
                     )
-                    if self.build_sos_signature(alert_key, latest_sos) != last_synced_signature:
+                    if sync_on_startup and self._build_alert_dedupe_key(alert_key, latest_sos) != last_synced_marker:
                         print("[SOS] Syncing the current latest SOS on startup.", flush=True)
                         try:
-                            last_synced_signature = self._sync_latest_sos_if_needed(
+                            last_synced_marker = self._sync_latest_sos_if_needed(
                                 alert_key=alert_key,
                                 latest_sos=latest_sos,
                                 event_path="/startup",
-                                last_synced_signature=last_synced_signature,
+                                last_synced_marker=last_synced_marker,
                             )
                         except Exception as exc:
                             print(f"[SOS] Startup sync error: {exc}", flush=True)
@@ -409,14 +476,21 @@ class FirebaseEmergencySync:
                     print("[SOS] Listener connected. Waiting for the first SOS alert...", flush=True)
 
                 def handle_event(event: Any) -> None:
-                    nonlocal last_synced_signature
+                    nonlocal last_synced_marker
                     try:
+                        event_path = getattr(event, "path", "/")
+                        # Firebase listeners commonly emit an initial "/" snapshot on connect.
+                        # Skip it so data refresh happens only for actual SOS updates.
+                        if event_path in {"", "/"}:
+                            return
+
                         alert_key, latest_sos = self.get_latest_sos_details()
-                        last_synced_signature = self._sync_latest_sos_if_needed(
+                        last_synced_marker = self._sync_latest_sos_if_needed(
                             alert_key=alert_key,
                             latest_sos=latest_sos,
-                            event_path=getattr(event, "path", "/"),
-                            last_synced_signature=last_synced_signature,
+                            event_path=event_path,
+                            last_synced_marker=last_synced_marker,
+                            ignore_marker=True,
                         )
                     except ValueError:
                         return
@@ -432,16 +506,16 @@ class FirebaseEmergencySync:
                     except ValueError:
                         continue
 
-                    current_signature = self.build_sos_signature(alert_key, latest_sos)
-                    if current_signature == last_synced_signature:
+                    current_marker = self._build_alert_dedupe_key(alert_key, latest_sos)
+                    if current_marker == last_synced_marker:
                         continue
 
                     print("[SOS] Poll fallback detected a new SOS.", flush=True)
-                    last_synced_signature = self._sync_latest_sos_if_needed(
+                    last_synced_marker = self._sync_latest_sos_if_needed(
                         alert_key=alert_key,
                         latest_sos=latest_sos,
                         event_path="/poll",
-                        last_synced_signature=last_synced_signature,
+                        last_synced_marker=last_synced_marker,
                     )
             except KeyboardInterrupt:
                 print("[SOS] Listener stopped.", flush=True)

@@ -163,6 +163,7 @@ def apply_priority_weights(data: pd.DataFrame, priority: str) -> pd.Series:
         "emergency": {"distance": 0.15, "response": 0.20, "emergency": 0.50, "availability": 0.15},
         "response": {"distance": 0.20, "response": 0.50, "emergency": 0.15, "availability": 0.15},
         "balanced": {"distance": 0.30, "response": 0.30, "emergency": 0.20, "availability": 0.20},
+        "best_of_best": {"distance": 0.45, "response": 0.20, "emergency": 0.20, "availability": 0.15},
     }
     selected = weights.get(normalized, weights["balanced"])
 
